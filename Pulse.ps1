@@ -13,6 +13,18 @@
 $mutex = New-Object System.Threading.Mutex($false, "Global\Pulse_TrayApp_SingleInstance")
 if (-not $mutex.WaitOne(0, $false)) { exit }
 
+# powershell.exe is not per-monitor DPI aware by default, so Windows silently
+# rescales the coordinates it hands to this process on any monitor that isn't
+# at 100% scaling (typical on a laptop's own screen). That mismatch is what
+# broke hover detection off an external monitor. Opting in to real per-monitor
+# DPI awareness here - before any window/icon is created - fixes it at the
+# source instead of trying to compensate for it in the hit-testing math.
+Add-Type -Namespace Pulse -Name DpiHelper -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+"@
+[void][Pulse.DpiHelper]::SetProcessDpiAwarenessContext([IntPtr](-4)) # PER_MONITOR_AWARE_V2
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -148,13 +160,28 @@ public class PulsePopup : Form {
         }
     }
 
+    private float dpiScale = 1.0F;
+    private int S(int px) { return (int)Math.Round(px * dpiScale); }
+    private Size S(int w, int h) { return new Size(S(w), S(h)); }
+    private Point P(int x, int y) { return new Point(S(x), S(y)); }
+
     public PulsePopup(Image claudeImg, Image gptImg) {
+        // Controls below are laid out with fixed pixel coordinates designed at
+        // 100% scaling (96 DPI). WinForms' own AutoScale modes (Font/Dpi) proved
+        // unreliable hosted inside powershell.exe, so instead every coordinate
+        // is multiplied by the monitor's real scale factor by hand via S()/P().
+        // Font sizes are in points, which GDI+ already resolves against DPI on
+        // its own, so fonts are left unscaled.
+        using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) {
+            dpiScale = g.DpiX / 96F;
+        }
+
         this.FormBorderStyle = FormBorderStyle.None;
         this.StartPosition = FormStartPosition.Manual;
         this.ShowInTaskbar = false;
         this.TopMost = true;
         this.BackColor = Color.FromArgb(28,28,30);
-        this.Size = new Size(258, 128);
+        this.Size = S(258, 128);
 
         Font baseFont = new Font("Segoe UI", 9F);
         Font boldFont = new Font("Segoe UI", 9.5F, FontStyle.Bold);
@@ -164,8 +191,8 @@ public class PulsePopup : Form {
 
         var divider = new Panel();
         divider.BackColor = Color.FromArgb(55,55,58);
-        divider.Size = new Size(234, 1);
-        divider.Location = new Point(12, 63);
+        divider.Size = S(234, 1);
+        divider.Location = P(12, 63);
         this.Controls.Add(divider);
 
         AddRow(gptImg, "ChatGPT", 70, out lblGptSession, out lblGptWeekly, baseFont, boldFont, gray);
@@ -176,8 +203,8 @@ public class PulsePopup : Form {
         lblFooter.Font = new Font("Segoe UI", 7.5F);
         lblFooter.AutoSize = false;
         lblFooter.TextAlign = ContentAlignment.MiddleRight;
-        lblFooter.Size = new Size(120, 16);
-        lblFooter.Location = new Point(this.Width - 120 - 10, 8);
+        lblFooter.Size = S(120, 16);
+        lblFooter.Location = P(258 - 120 - 10, 8);
         this.Controls.Add(lblFooter);
     }
 
@@ -186,8 +213,8 @@ public class PulsePopup : Form {
         var pic = new PictureBox();
         pic.Image = img;
         pic.SizeMode = PictureBoxSizeMode.Zoom;
-        pic.Size = new Size(20, 20);
-        pic.Location = new Point(12, y);
+        pic.Size = S(20, 20);
+        pic.Location = P(12, y);
         pic.BackColor = Color.Transparent;
         this.Controls.Add(pic);
 
@@ -196,7 +223,7 @@ public class PulsePopup : Form {
         nameLbl.ForeColor = Color.White;
         nameLbl.Font = boldFont;
         nameLbl.AutoSize = true;
-        nameLbl.Location = new Point(38, y + 1);
+        nameLbl.Location = P(38, y + 1);
         this.Controls.Add(nameLbl);
 
         var sLbl = new Label();
@@ -204,7 +231,7 @@ public class PulsePopup : Form {
         sLbl.ForeColor = gray;
         sLbl.Font = baseFont;
         sLbl.AutoSize = true;
-        sLbl.Location = new Point(38, y + 22);
+        sLbl.Location = P(38, y + 22);
         this.Controls.Add(sLbl);
 
         sessionVal = new Label();
@@ -212,7 +239,7 @@ public class PulsePopup : Form {
         sessionVal.Font = boldFont;
         sessionVal.ForeColor = Color.White;
         sessionVal.AutoSize = true;
-        sessionVal.Location = new Point(95, y + 22);
+        sessionVal.Location = P(95, y + 22);
         this.Controls.Add(sessionVal);
 
         var wLbl = new Label();
@@ -220,7 +247,7 @@ public class PulsePopup : Form {
         wLbl.ForeColor = gray;
         wLbl.Font = baseFont;
         wLbl.AutoSize = true;
-        wLbl.Location = new Point(150, y + 22);
+        wLbl.Location = P(150, y + 22);
         this.Controls.Add(wLbl);
 
         weeklyVal = new Label();
@@ -228,7 +255,7 @@ public class PulsePopup : Form {
         weeklyVal.Font = boldFont;
         weeklyVal.ForeColor = Color.White;
         weeklyVal.AutoSize = true;
-        weeklyVal.Location = new Point(207, y + 22);
+        weeklyVal.Location = P(207, y + 22);
         this.Controls.Add(weeklyVal);
     }
 }
