@@ -32,10 +32,31 @@ claude auth login
 Pulse picks up the refreshed credentials on its own on the next poll (every 5 min,
 or "Actualizar ahora" from the tray menu) — no restart needed.
 
-**Still open:** whether a plain reboot alone can break the session again, or
-whether it only happens when both the Windows-native and WSL `claude` installs are
-logged into the same account at once.
+**Confirmed (2026-08-28):** yes, a plain reboot reliably breaks it, and the dual-install
+rotation theory above wasn't needed to explain it. Compared the two credential
+files' `expiresAt` directly: the Windows-native token issued at 18:23 expired at
+02:23 the next day - exactly 8h later, the access token's fixed lifetime. Nothing
+on the Windows-native side had invoked `claude` since that login, so nothing
+refreshed it. `Get-ClaudeUsage` only ever reads the saved `accessToken` and calls
+the usage endpoint directly - it never triggers a refresh, only a real `claude`
+invocation does that. Since the PC is off overnight, by the next boot more than 8h
+have routinely passed with no native `claude` invocation, so the token is already
+dead on the first poll. It reads as "caused by reboot" but the actual trigger is
+elapsed idle time past the 8h TTL, which reboot happens to correlate with.
 
-**Considered but not implemented:** `claude setup-token` generates a long-lived
-token that wouldn't depend on an interactive OAuth session staying alive. Could
-replace the `.credentials.json` read in `Get-ClaudeUsage` if this keeps recurring.
+**Tried and rejected:** `claude setup-token` for a long-lived token, to sidestep
+the refresh entirely. Generated one and hit `/api/oauth/usage` with it directly -
+403, `oauth_scope_insufficient`. `setup-token` sessions only get the
+`user:inference` scope; the usage endpoint requires `user:profile`, which that
+token flow never grants. Confirmed via direct API test, not from docs.
+
+**Fix (implemented):** `Get-ClaudeUsage` now retries. On a 401 it shells out to
+the cheapest possible real invocation (`claude -p "hi" --model haiku`, 30s
+timeout) to force the CLI's own legitimate refresh-token exchange - the same
+thing manually running `claude` once used to do - then re-reads
+`.credentials.json` and retries the usage call once. Gated to once per 20 min so
+a real outage (network down, etc.) can't turn into repeated live Claude calls on
+every 5-minute poll. `claude auth --help` on the native install confirmed there's
+no cheaper `refresh`-only subcommand (`auth` only has `login` / `logout` /
+`status`, and `status` just reads cached local state without attempting a
+refresh) - a real invocation is the only supported way to force it.

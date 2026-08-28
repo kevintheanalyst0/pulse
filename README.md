@@ -38,9 +38,11 @@ those settings pages use, on a 5-minute timer, and surfaces it as a tray icon.
 - [OpenAI Codex CLI](https://github.com/openai/codex) installed and logged in
   natively on Windows with your ChatGPT account (`codex login`).
 
-Both CLIs auto-refresh their saved token on normal use, so Pulse stays accurate as
-long as you touch either tool now and then. If a reading ever shows "?", the token
-went stale — just run `claude` or `codex` once to refresh it.
+Both CLIs auto-refresh their saved token on normal use. For Claude, Pulse also
+self-heals: if the saved token has gone stale (e.g. after the PC was off longer
+than the ~8h token lifetime), it fires a cheap real `claude -p` call itself to
+force a refresh before retrying - see `docs/TROUBLESHOOTING.md`. Codex has no
+such fallback yet; if a ChatGPT reading ever shows "?", just run `codex` once.
 
 ## Install
 

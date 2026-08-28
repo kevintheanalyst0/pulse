@@ -32,18 +32,56 @@ $scriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $claudeCredPath = Join-Path $env:USERPROFILE ".claude\.credentials.json"
 $codexAuthPath  = Join-Path $env:USERPROFILE ".codex\auth.json"
 
+function Invoke-ClaudeUsageCall {
+    $cred  = Get-Content $claudeCredPath -Raw | ConvertFrom-Json
+    $token = $cred.claudeAiOauth.accessToken
+    $resp  = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
+                -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 15
+    [PSCustomObject]@{
+        Session = [math]::Round($resp.five_hour.utilization)
+        Weekly  = [math]::Round($resp.seven_day.utilization)
+        Ok      = $true
+    }
+}
+
+# The saved accessToken is only ~8h-lived and Pulse never refreshes it itself -
+# only a real `claude` CLI invocation does that (via its refresh_token). After
+# the PC has been off overnight that token is routinely dead on the first poll,
+# which used to show "?" until you manually ran `claude` once. So on a 401,
+# fire the cheapest possible real invocation to force that refresh, then retry
+# once. Gated to once per 20 min so a genuine outage (network down, etc.)
+# doesn't spam real Claude calls on every 5-minute poll.
+$script:lastClaudeRefreshAttempt = $null
+function Invoke-ClaudeTokenRefresh {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "claude"
+        $psi.Arguments = '-p "hi" --model haiku'
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc.WaitForExit(30000)) { $proc.Kill() }
+    } catch {}
+}
+
 function Get-ClaudeUsage {
     try {
-        $cred  = Get-Content $claudeCredPath -Raw | ConvertFrom-Json
-        $token = $cred.claudeAiOauth.accessToken
-        $resp  = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
-                    -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 15
-        [PSCustomObject]@{
-            Session = [math]::Round($resp.five_hour.utilization)
-            Weekly  = [math]::Round($resp.seven_day.utilization)
-            Ok      = $true
-        }
+        Invoke-ClaudeUsageCall
     } catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+
+        $now = Get-Date
+        $dueForRetry = -not $script:lastClaudeRefreshAttempt -or
+            ($now - $script:lastClaudeRefreshAttempt).TotalMinutes -ge 20
+
+        if ($status -eq 401 -and $dueForRetry) {
+            $script:lastClaudeRefreshAttempt = $now
+            Invoke-ClaudeTokenRefresh
+            try { return Invoke-ClaudeUsageCall } catch {}
+        }
         [PSCustomObject]@{ Session = $null; Weekly = $null; Ok = $false }
     }
 }
