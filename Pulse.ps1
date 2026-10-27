@@ -32,6 +32,43 @@ $scriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $claudeCredPath = Join-Path $env:USERPROFILE ".claude\.credentials.json"
 $codexAuthPath  = Join-Path $env:USERPROFILE ".codex\auth.json"
 
+# Runs a local CLI command and returns its exit code (-1 on failure/timeout).
+# Both CLIs answer their login-status check from the cached credentials, so this
+# is free and tells a genuinely signed-out session (refresh token dead - nothing
+# Pulse can self-heal) apart from a transient network/API error.
+function Get-CliExitCode($file, $arguments) {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $file
+        $psi.Arguments = $arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc.WaitForExit(15000)) { $proc.Kill(); return -1 }
+        $proc.ExitCode
+    } catch { -1 }
+}
+
+function Test-ClaudeSignedOut {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "claude"
+        $psi.Arguments = "auth status"
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $out = $proc.StandardOutput.ReadToEnd()
+        if (-not $proc.WaitForExit(15000)) { $proc.Kill(); return $false }
+        ($out | ConvertFrom-Json).loggedIn -eq $false
+    } catch { $false }
+}
+
+function Test-CodexSignedOut { (Get-CliExitCode "codex" "login status") -gt 0 }
+
 function Invoke-ClaudeUsageCall {
     $cred  = Get-Content $claudeCredPath -Raw | ConvertFrom-Json
     $token = $cred.claudeAiOauth.accessToken
@@ -82,25 +119,63 @@ function Get-ClaudeUsage {
             Invoke-ClaudeTokenRefresh
             try { return Invoke-ClaudeUsageCall } catch {}
         }
-        [PSCustomObject]@{ Session = $null; Weekly = $null; Ok = $false }
+        [PSCustomObject]@{ Session = $null; Weekly = $null; Ok = $false; Expired = (Test-ClaudeSignedOut) }
     }
+}
+
+function Invoke-ChatGptUsageCall {
+    $auth      = Get-Content $codexAuthPath -Raw | ConvertFrom-Json
+    $token     = $auth.tokens.access_token
+    $accountId = $auth.tokens.account_id
+    $resp      = Invoke-RestMethod -Uri "https://chatgpt.com/backend-api/wham/usage" `
+                    -Headers @{ Authorization = "Bearer $token"; "chatgpt-account-id" = $accountId } `
+                    -TimeoutSec 15
+    [PSCustomObject]@{
+        Session = [math]::Round($resp.rate_limit.primary_window.used_percent)
+        Weekly  = [math]::Round($resp.rate_limit.secondary_window.used_percent)
+        Ok      = $true
+    }
+}
+
+# Same fix as Claude's: the cached codex access_token goes stale (e.g. after the
+# PC has been off overnight) and Pulse never refreshes it itself. On a 401, fire
+# a cheap real `codex exec` invocation - that forces codex to use its
+# refresh_token and re-cache a fresh access_token - then retry once. Gated to
+# once per 20 min so a genuine outage doesn't spam real codex calls every poll.
+# --skip-git-repo-check because the tray app's working directory isn't a git repo.
+$script:lastGptRefreshAttempt = $null
+function Invoke-CodexTokenRefresh {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "codex"
+        $psi.Arguments = 'exec --skip-git-repo-check "hi"'
+        $psi.WorkingDirectory = $scriptDir
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc.WaitForExit(30000)) { $proc.Kill() }
+    } catch {}
 }
 
 function Get-ChatGptUsage {
     try {
-        $auth      = Get-Content $codexAuthPath -Raw | ConvertFrom-Json
-        $token     = $auth.tokens.access_token
-        $accountId = $auth.tokens.account_id
-        $resp      = Invoke-RestMethod -Uri "https://chatgpt.com/backend-api/wham/usage" `
-                        -Headers @{ Authorization = "Bearer $token"; "chatgpt-account-id" = $accountId } `
-                        -TimeoutSec 15
-        [PSCustomObject]@{
-            Session = [math]::Round($resp.rate_limit.primary_window.used_percent)
-            Weekly  = [math]::Round($resp.rate_limit.secondary_window.used_percent)
-            Ok      = $true
-        }
+        Invoke-ChatGptUsageCall
     } catch {
-        [PSCustomObject]@{ Session = $null; Weekly = $null; Ok = $false }
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+
+        $now = Get-Date
+        $dueForRetry = -not $script:lastGptRefreshAttempt -or
+            ($now - $script:lastGptRefreshAttempt).TotalMinutes -ge 20
+
+        if ($status -eq 401 -and $dueForRetry) {
+            $script:lastGptRefreshAttempt = $now
+            Invoke-CodexTokenRefresh
+            try { return Invoke-ChatGptUsageCall } catch {}
+        }
+        [PSCustomObject]@{ Session = $null; Weekly = $null; Ok = $false; Expired = (Test-CodexSignedOut) }
     }
 }
 
@@ -186,6 +261,16 @@ public class PulsePopup : Form {
     public Label lblGptSession;
     public Label lblGptWeekly;
     public Label lblFooter;
+    public Label lblClaudeLogin;
+    public Label lblGptLogin;
+    private System.Collections.Generic.List<Control> claudeCtl = new System.Collections.Generic.List<Control>();
+    private System.Collections.Generic.List<Control> gptCtl = new System.Collections.Generic.List<Control>();
+
+    // Swaps a row's session/weekly numbers for a clickable "sign in" link.
+    public void SetExpired(bool claude, bool expired) {
+        foreach (Control c in (claude ? claudeCtl : gptCtl)) c.Visible = !expired;
+        (claude ? lblClaudeLogin : lblGptLogin).Visible = expired;
+    }
 
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams {
@@ -225,7 +310,7 @@ public class PulsePopup : Form {
         Font boldFont = new Font("Segoe UI", 9.5F, FontStyle.Bold);
         Color gray = Color.FromArgb(160,160,160);
 
-        AddRow(claudeImg, "Claude", 10, out lblClaudeSession, out lblClaudeWeekly, baseFont, boldFont, gray);
+        AddRow(claudeImg, "Claude", 10, out lblClaudeSession, out lblClaudeWeekly, out lblClaudeLogin, claudeCtl, baseFont, boldFont, gray);
 
         var divider = new Panel();
         divider.BackColor = Color.FromArgb(55,55,58);
@@ -233,7 +318,7 @@ public class PulsePopup : Form {
         divider.Location = P(12, 63);
         this.Controls.Add(divider);
 
-        AddRow(gptImg, "ChatGPT", 70, out lblGptSession, out lblGptWeekly, baseFont, boldFont, gray);
+        AddRow(gptImg, "ChatGPT", 70, out lblGptSession, out lblGptWeekly, out lblGptLogin, gptCtl, baseFont, boldFont, gray);
 
         lblFooter = new Label();
         lblFooter.Text = "";
@@ -247,6 +332,7 @@ public class PulsePopup : Form {
     }
 
     private void AddRow(Image img, string name, int y, out Label sessionVal, out Label weeklyVal,
+                         out Label loginLink, System.Collections.Generic.List<Control> rowCtl,
                          Font baseFont, Font boldFont, Color gray) {
         var pic = new PictureBox();
         pic.Image = img;
@@ -271,6 +357,7 @@ public class PulsePopup : Form {
         sLbl.AutoSize = true;
         sLbl.Location = P(38, y + 22);
         this.Controls.Add(sLbl);
+        rowCtl.Add(sLbl);
 
         sessionVal = new Label();
         sessionVal.Text = "--";
@@ -279,6 +366,7 @@ public class PulsePopup : Form {
         sessionVal.AutoSize = true;
         sessionVal.Location = P(95, y + 22);
         this.Controls.Add(sessionVal);
+        rowCtl.Add(sessionVal);
 
         var wLbl = new Label();
         wLbl.Text = "Semana";
@@ -287,6 +375,7 @@ public class PulsePopup : Form {
         wLbl.AutoSize = true;
         wLbl.Location = P(150, y + 22);
         this.Controls.Add(wLbl);
+        rowCtl.Add(wLbl);
 
         weeklyVal = new Label();
         weeklyVal.Text = "--";
@@ -295,6 +384,17 @@ public class PulsePopup : Form {
         weeklyVal.AutoSize = true;
         weeklyVal.Location = P(207, y + 22);
         this.Controls.Add(weeklyVal);
+        rowCtl.Add(weeklyVal);
+
+        loginLink = new Label();
+        loginLink.Text = "Sesion caducada - clic para entrar";
+        loginLink.ForeColor = Color.FromArgb(255,193,7);
+        loginLink.Font = new Font("Segoe UI", 9F, FontStyle.Underline);
+        loginLink.Cursor = Cursors.Hand;
+        loginLink.AutoSize = true;
+        loginLink.Location = P(38, y + 22);
+        loginLink.Visible = false;
+        this.Controls.Add(loginLink);
     }
 }
 "@
@@ -321,6 +421,30 @@ function Set-PercentLabel($lbl, $val, $ok) {
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Text = ""
 
+# Sign-in flow: opens the CLI's own interactive login in a visible window (it
+# launches the browser), then re-polls every few seconds until the session is
+# back so the popup recovers without waiting for the 5-minute refresh.
+$script:signedOut = @{ claude = $false; codex = $false }
+$script:loginWatchUntil = $null
+function Start-CliLogin($which) {
+    try {
+        if ($which -eq "claude") { Start-Process "claude" -ArgumentList "auth","login" }
+        else                      { Start-Process "codex"  -ArgumentList "login" }
+    } catch {}
+    $script:loginWatchUntil = (Get-Date).AddMinutes(5)
+    $loginWatch.Start()
+}
+$loginWatch = New-Object System.Windows.Forms.Timer
+$loginWatch.Interval = 5000
+$loginWatch.Add_Tick({
+    Update-Tray
+    if (-not ($script:signedOut.claude -or $script:signedOut.codex) -or (Get-Date) -gt $script:loginWatchUntil) {
+        $loginWatch.Stop()
+    }
+})
+$popup.lblClaudeLogin.Add_Click({ Start-CliLogin "claude" })
+$popup.lblGptLogin.Add_Click({ Start-CliLogin "codex" })
+
 function Update-Tray {
     $claude = Get-ClaudeUsage
     $gpt    = Get-ChatGptUsage
@@ -329,6 +453,13 @@ function Update-Tray {
     Set-PercentLabel $popup.lblClaudeWeekly  $claude.Weekly  $claude.Ok
     Set-PercentLabel $popup.lblGptSession    $gpt.Session    $gpt.Ok
     Set-PercentLabel $popup.lblGptWeekly     $gpt.Weekly     $gpt.Ok
+
+    $script:signedOut.claude = [bool]$claude.Expired
+    $script:signedOut.codex  = [bool]$gpt.Expired
+    $popup.SetExpired($true,  $script:signedOut.claude)
+    $popup.SetExpired($false, $script:signedOut.codex)
+    $claudeLoginItem.Visible = $script:signedOut.claude
+    $codexLoginItem.Visible  = $script:signedOut.codex
     $popup.lblFooter.Text = "actualizado $(Get-Date -Format 'HH:mm')"
 
     $vals = @($claude.Session, $claude.Weekly, $gpt.Session, $gpt.Weekly) | Where-Object { $null -ne $_ }
@@ -366,6 +497,12 @@ $pollTimer.Start()
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $refreshItem = $menu.Items.Add("Actualizar ahora")
 $refreshItem.Add_Click({ Update-Tray })
+$claudeLoginItem = $menu.Items.Add("Iniciar sesion en Claude")
+$claudeLoginItem.Visible = $false
+$claudeLoginItem.Add_Click({ Start-CliLogin "claude" })
+$codexLoginItem = $menu.Items.Add("Iniciar sesion en ChatGPT")
+$codexLoginItem.Visible = $false
+$codexLoginItem.Add_Click({ Start-CliLogin "codex" })
 $menu.Items.Add("-") | Out-Null
 $exitItem = $menu.Items.Add("Salir de Pulse")
 $exitItem.Add_Click({
